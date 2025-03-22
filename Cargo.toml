@@ -1,0 +1,10 @@
+[package]
+name = "leaky-bucket"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = {version = "0.8.1", features = ["macros"]}
+tokio = { version = "1.44.0", features = ["full"] }
+tower = { version = "0.5.2" }
+tower-http = {version = "0.6.2", features = ["trace"] }

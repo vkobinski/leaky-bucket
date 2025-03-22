@@ -4,7 +4,7 @@ use axum::{
 };
 use std::{
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Clone)]
@@ -121,7 +121,7 @@ impl LeakyBucket {
         }
     }
 
-    fn try_acquire(&mut self, policy: RateLimitPolicy) -> bool {
+    fn try_acquire_or_wait(&mut self, policy: RateLimitPolicy) -> Duration {
         let (leak_rate, capacity) = policy.config();
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_updated).as_secs_f64();
@@ -129,9 +129,11 @@ impl LeakyBucket {
         self.tokens = (self.tokens + elapsed * leak_rate).min(capacity);
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
-            true
+            Duration::from_secs(0)
         } else {
-            false
+            let missing = 1.0 - self.tokens;
+            let wait_time = missing / leak_rate;
+            Duration::from_secs_f64(wait_time)
         }
     }
 }
@@ -146,26 +148,26 @@ fn url_to_policy(path: &str, method: &str) -> RateLimitPolicy {
 
 #[axum::debug_middleware]
 async fn rate_limiter_middleware(
-   State(state): State<Arc<Mutex<LeakyBucket>>>,
+    State(state): State<Arc<Mutex<LeakyBucket>>>,
     req: Request,
     next: Next,
 ) -> Response {
-
     let path = req.uri().path();
     let method = req.method().to_string();
     let policy = url_to_policy(path, &method);
 
-    let can_proceed = {
-        let mut bucket_guard = state.lock().unwrap();
-        bucket_guard.try_acquire(policy)
-    }; 
+    loop {
+        let wait_time = {
+            let mut bucket_guard = state.lock().unwrap();
+            bucket_guard.try_acquire_or_wait(policy)
+        };
 
-    if !can_proceed {
-        println!("Rate limit exceeded");
-        return Response::builder()
-            .status(StatusCode::TOO_MANY_REQUESTS)
-            .body(Body::empty())
-            .unwrap();
+        if wait_time.is_zero() {
+            break;
+        } else {
+            println!("Waiting for token: sleeping for {:?}", wait_time);
+            tokio::time::sleep(wait_time).await;
+        }
     }
 
     next.run(req).await

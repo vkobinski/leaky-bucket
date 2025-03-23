@@ -1,26 +1,28 @@
 use axum::{
-    body::Body, extract::{Request, State}, http::StatusCode, middleware::{from_fn_with_state, Next}, response::Response, routing::get, Router
-
+    extract::{Request, State},
+    middleware::{from_fn_with_state, Next},
+    response::Response,
+    routing::get,
+    Router,
 };
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use strum::IntoEnumIterator;
+use strum_macros::EnumIter;
 
-#[derive(Debug, Clone)]
-struct LeakyBucket {
-    tokens: f64,
-    last_updated: Instant,
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum UserCategory {
-    PF, 
-    PJ, 
+    PF,
+    #[default]
+    PJ,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum ParticipantCategory {
+    #[default]
     A,
     B,
     C,
@@ -31,7 +33,7 @@ pub enum ParticipantCategory {
     H,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, EnumIter)]
 pub enum RateLimitPolicy {
     EntriesReadUserAntiscan(UserCategory),
     EntriesReadUserAntiscanV2(UserCategory),
@@ -112,13 +114,75 @@ impl RateLimitPolicy {
     }
 }
 
+#[derive(Debug)]
+struct Bucket {
+    tokens: f64,
+    last_updated: Instant,
+    policy: RateLimitPolicy,
+    queue: Vec<Request>,
+}
+
+impl Bucket {
+    fn new(policy: RateLimitPolicy) -> Self {
+        Self {
+            tokens: policy.config().1,
+            last_updated: Instant::now(),
+            policy,
+            queue: vec![],
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LeakyBucket {
+    tokens: f64,
+    last_updated: Instant,
+    buckets: Vec<Bucket>,
+}
 
 impl LeakyBucket {
     fn new(capacity: f64) -> Self {
+        let buckets = RateLimitPolicy::iter().map(|p| Bucket::new(p)).collect();
+
         Self {
             tokens: capacity,
             last_updated: Instant::now(),
+            buckets,
         }
+    }
+
+    pub async fn main_task(&mut self) {
+        loop {
+            self.replenish_buckets();
+
+            for bucket in self.buckets.iter_mut() {
+                let available = bucket.tokens.floor() as usize;
+                let num_to_process = available.min(bucket.queue.len());
+
+                for _ in 0..num_to_process {
+                    bucket.tokens -= 1.0;
+
+                    let req = bucket.queue.remove(0);
+
+                    tokio::spawn(async move {
+
+                    });
+                }
+            }
+        }
+    }
+
+    pub fn replenish_buckets(&mut self) {
+        let buckets = &mut self.buckets;
+
+        buckets.iter_mut().for_each(|b| {
+            let (leak_rate, capacity) = b.policy.config();
+            let now = Instant::now();
+            let elapsed = now.duration_since(b.last_updated).as_secs_f64();
+            b.last_updated = now;
+
+            b.tokens = (b.tokens + elapsed * leak_rate).min(capacity);
+        });
     }
 
     fn try_acquire_or_wait(&mut self, policy: RateLimitPolicy) -> Duration {
@@ -185,9 +249,11 @@ async fn main() {
         .route("/", get(hello_handler))
         .route("/claims", get(hello_handler))
         .layer(from_fn_with_state(bucket.clone(), rate_limiter_middleware))
-        .with_state(bucket) ;
+        .with_state(bucket);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
 
-    axum::serve(listener, app.into_make_service()).await.unwrap();
+    axum::serve(listener, app.into_make_service())
+        .await
+        .unwrap();
 }

@@ -165,15 +165,19 @@ impl LeakyBucket {
         });
     }
 
-    fn acquire(&mut self, policy: RateLimitPolicy) -> Duration {
+    async fn acquire(&mut self, policy: RateLimitPolicy) -> Duration {
         let bucket = self
             .buckets
             .iter_mut()
             .find(|p| p.policy.config() == policy.config())
             .unwrap();
 
-        dbg!(bucket.policy);
-        dbg!(bucket.tokens);
+        let (rate, capacity) = bucket.policy.config();
+
+        if capacity / bucket.tokens <= 0.75 {
+            let delay = Duration::from_secs_f64(rate * 0.75);
+            tokio::time::sleep(delay).await;
+        }
 
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
@@ -204,16 +208,17 @@ async fn rate_limiter_middleware(
     let method = req.method().to_string();
     let policy = url_to_policy(path, &method);
 
+    let now = Instant::now();
+
     loop {
         let wait_time = {
             let mut bucket_guard = state.lock().await;
-            bucket_guard.acquire(policy)
+            bucket_guard.acquire(policy).await
         };
 
         if wait_time.is_zero() {
             break;
         } else {
-            println!("Waiting for token: sleeping for {:?}", wait_time);
             tokio::time::sleep(wait_time).await;
         }
     }

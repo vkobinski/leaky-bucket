@@ -54,6 +54,11 @@ def analyze_results(results, burst_capacity, expected_delay, tolerance=0.2):
     if delayed_group and avg_delayed_latency < expected_min_delay:
         print(f"FAIL: Delayed requests too fast (expected min {expected_min_delay:.1f}s)")
         passed = False
+
+    expected_max_delay = expected_delay * (1 + tolerance)
+    if not (expected_min_delay <= avg_delayed_latency <= expected_max_delay):
+        print(f"FAIL: Delays out of range ({expected_min_delay:.1f}-{expected_max_delay:.1f}s)")
+        passed = False
         
     # Check request success rate
     success_count = sum(1 for _, status in results if status == 200)
@@ -72,8 +77,8 @@ async def main():
         {
             "path": "/",
             "burst_capacity": 1000,  # PJ category burst size
-            "requests": 1010,        # 1000 burst + 100 delayed
-            "expected_delay": 3.0,   # 1 / (20/60) = 3s per request
+            "requests": 1100,        
+            "expected_delay": 160.0,   
             "concurrency": 100
         },
         {

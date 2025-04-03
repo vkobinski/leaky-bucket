@@ -5,25 +5,34 @@ use axum::{
     routing::get,
     Router,
 };
-use tokio::sync::Mutex;
-
 use std::{
+    collections::VecDeque,
+    hash::{Hash, Hasher},
     sync::Arc,
     time::{Duration, Instant},
 };
 use strum::IntoEnumIterator;
-use strum_macros::EnumIter;
+use strum_macros::{EnumIter, EnumString, EnumVariantNames};
+use tokio::sync::{oneshot, Mutex};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+//
+// RateLimitPolicy and helper enums
+//
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UserCategory {
     PF,
-    #[default]
     PJ,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+impl Default for UserCategory {
+    fn default() -> Self {
+        Self::PJ
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParticipantCategory {
-    #[default]
     A,
     B,
     C,
@@ -34,7 +43,13 @@ pub enum ParticipantCategory {
     H,
 }
 
-#[derive(Debug, Clone, Copy, EnumIter, PartialEq)]
+impl Default for ParticipantCategory {
+    fn default() -> Self {
+        Self::A
+    }
+}
+
+#[derive(Debug, Clone, Copy, EnumIter, PartialEq, Eq, Hash)]
 pub enum RateLimitPolicy {
     EntriesReadUserAntiscan(UserCategory),
     EntriesReadUserAntiscanV2(UserCategory),
@@ -68,6 +83,7 @@ pub enum RateLimitPolicy {
 }
 
 impl RateLimitPolicy {
+    /// Returns (leak_rate, capacity)
     pub fn config(&self) -> (f64, f64) {
         match *self {
             RateLimitPolicy::EntriesReadUserAntiscan(category)
@@ -115,81 +131,110 @@ impl RateLimitPolicy {
     }
 }
 
+//
+// Bucket and LeakyBucket with FIFO waiting queue
+//
+
 #[derive(Debug)]
 struct Bucket {
     tokens: f64,
     last_updated: Instant,
     policy: RateLimitPolicy,
+    // FIFO queue of waiting tasks
+    waiters: VecDeque<oneshot::Sender<()>>,
 }
 
 impl Bucket {
     fn new(policy: RateLimitPolicy) -> Self {
+        let (_, capacity) = policy.config();
         Self {
-            tokens: policy.config().1,
+            tokens: capacity,
             last_updated: Instant::now(),
             policy,
+            waiters: VecDeque::new(),
+        }
+    }
+
+    /// Replenish tokens based on elapsed time and notify waiting tasks.
+    async fn refill(&mut self) {
+        let (leak_rate, capacity) = self.policy.config();
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_updated).as_secs_f64();
+        self.last_updated = now;
+
+        // Add tokens but do not exceed capacity.
+        self.tokens = (self.tokens + elapsed * leak_rate).min(capacity);
+
+        // While tokens are available and there are waiting tasks, consume a token and notify one waiter.
+        while self.tokens >= 1.0 {
+            if let Some(waiter) = self.waiters.pop_front() {
+                // Consume token for this waiter.
+                self.tokens -= 1.0;
+                // Notify the waiting task.
+                let _ = waiter.send(());
+            } else {
+                break;
+            }
         }
     }
 }
 
+/// The overall rate limiter.
+/// We store one bucket per policy in an Arc so that each bucket is independently locked.
 #[derive(Debug)]
 struct LeakyBucket {
-    last_updated: Instant,
-    buckets: Vec<Bucket>,
+    buckets: Vec<Arc<Mutex<Bucket>>>,
 }
 
 impl LeakyBucket {
     fn new() -> Self {
-        let buckets = RateLimitPolicy::iter().map(|p| Bucket::new(p)).collect();
+        let buckets = RateLimitPolicy::iter()
+            .map(|policy| Arc::new(Mutex::new(Bucket::new(policy))))
+            .collect();
+        Self { buckets }
+    }
 
-        Self {
-            last_updated: Instant::now(),
-            buckets,
+    async fn acquire(&self, policy: RateLimitPolicy) {
+        // Find the matching bucket
+        let bucket = {
+            let mut found_bucket = None;
+            for b in &self.buckets {
+                let bucket_guard = b.lock().await;
+                if bucket_guard.policy.config() == policy.config() {
+                    found_bucket = Some(b.clone());
+                    break;
+                }
+            }
+            found_bucket.expect("Bucket for policy should exist")
+        };
+
+        loop {
+            let mut b = bucket.lock().await;
+            if b.tokens >= 1.0 {
+                b.tokens -= 1.0;
+                return;
+            } else {
+                let (sender, receiver) = oneshot::channel();
+                b.waiters.push_back(sender);
+                drop(b);
+                let _ = receiver.await;
+            }
         }
     }
 
-    pub async fn main_task(&mut self) {
-        self.replenish_buckets();
-    }
-
-    pub fn replenish_buckets(&mut self) {
-        let buckets = &mut self.buckets;
-
-        buckets.iter_mut().for_each(|b| {
-            let (leak_rate, capacity) = b.policy.config();
-            let now = Instant::now();
-            let elapsed = now.duration_since(b.last_updated).as_secs_f64();
-            b.last_updated = now;
-
-            b.tokens = (b.tokens + elapsed * leak_rate).min(capacity);
-        });
-    }
-
-    async fn acquire(&mut self, policy: RateLimitPolicy) -> Duration {
-        let bucket = self
-            .buckets
-            .iter_mut()
-            .find(|p| p.policy.config() == policy.config())
-            .unwrap();
-
-        let (rate, capacity) = bucket.policy.config();
-
-        if capacity / bucket.tokens <= 0.75 {
-            let delay = Duration::from_secs_f64(rate * 0.75);
-            tokio::time::sleep(delay).await;
-        }
-
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            Duration::from_secs(0)
-        } else {
-            let missing = 1.0 - bucket.tokens;
-            let wait_time = missing / bucket.policy.config().0;
-            Duration::from_secs_f64(wait_time)
+    async fn refill_all(&self) {
+        for bucket in &self.buckets {
+            let mut b = bucket.lock().await;
+            b.refill().await;
         }
     }
 }
 
+//
+// Axum middleware and server
+//
+
+// Map a URL (path & method) to a policy.
 fn url_to_policy(path: &str, method: &str) -> RateLimitPolicy {
     match (path, method) {
         ("/claims", "POST") => RateLimitPolicy::ClaimsWrite,
@@ -198,48 +243,36 @@ fn url_to_policy(path: &str, method: &str) -> RateLimitPolicy {
     }
 }
 
+// This middleware calls `acquire` on the appropriate bucket.
+// It loops until the token is acquired.
 #[axum::debug_middleware]
 async fn rate_limiter_middleware(
-    State(state): State<Arc<Mutex<LeakyBucket>>>,
+    State(state): State<Arc<LeakyBucket>>,
     req: Request,
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    let method = req.method().to_string();
-    let policy = url_to_policy(path, &method);
+    let method = req.method().as_str();
+    let policy = url_to_policy(path, method);
 
-    let now = Instant::now();
-
-    loop {
-        let wait_time = {
-            let mut bucket_guard = state.lock().await;
-            bucket_guard.acquire(policy).await
-        };
-
-        if wait_time.is_zero() {
-            break;
-        } else {
-            tokio::time::sleep(wait_time).await;
-        }
-    }
-
+    state.acquire(policy).await;
     next.run(req).await
 }
 
+// A simple handler.
 async fn hello_handler() -> &'static str {
     "Hello, World!"
 }
 
 #[tokio::main]
 async fn main() {
-    let bucket = Arc::new(Mutex::new(LeakyBucket::new()));
+    let bucket = Arc::new(LeakyBucket::new());
 
+    // Spawn a background task to periodically refill all buckets.
     let bucket_clone = bucket.clone();
     tokio::spawn(async move {
         loop {
-            {
-                bucket_clone.lock().await.main_task().await;
-            }
+            bucket_clone.refill_all().await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     });
@@ -248,6 +281,7 @@ async fn main() {
         .route("/", get(hello_handler))
         .route("/claims", get(hello_handler))
         .layer(from_fn_with_state(bucket.clone(), rate_limiter_middleware))
+        // Optionally attach state to handlers.
         .with_state(bucket);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();

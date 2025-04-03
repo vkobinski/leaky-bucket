@@ -77,8 +77,8 @@ async def main():
         {
             "path": "/",
             "burst_capacity": 1000,  # PJ category burst size
-            "requests": 1100,        
-            "expected_delay": 160.0,   
+            "requests": 1101,        
+            "expected_delay": 3,   
             "concurrency": 100
         },
         {
